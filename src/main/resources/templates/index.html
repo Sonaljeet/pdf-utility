@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<head>
+    <title>PDF Utility</title>
+    <style>
+        body { font-family: Arial; margin: 40px; }
+        textarea { width: 100%; height: 200px; margin-bottom: 20px; }
+        input[type="file"], input[type="text"] { margin-bottom: 10px; width: 100%; }
+    </style>
+</head>
+<body>
+<h2>PDF Text & OCR Extractor, Comparator</h2>
+<form method="post" enctype="multipart/form-data" action="/process">
+    <label>Select First PDF:</label><br/>
+    <input type="file" name="file1" required><br/>
+
+    <label>Select Second PDF (optional):</label><br/>
+    <input type="file" name="file2"><br/>
+
+    <label>Enter Text to Verify in PDF (comma-separated):</label><br/>
+    <input type="text" name="verifyText" placeholder="e.g., Invoice, Payment, Total"><br/>
+
+    <button type="submit">Submit</button>
+</form>
+
+<div th:if="${verificationResult}">
+    <h3>Verification Result:</h3>
+    <pre th:text="${verificationResult}"></pre>
+</div>
+
+<div th:if="${text1}">
+    <h3>Extracted Text (File 1):</h3>
+    <textarea readonly th:text="${text1}"></textarea>
+</div>
+
+<div th:if="${imageText1}">
+    <h3>Image Text (OCR - File 1):</h3>
+    <textarea readonly th:text="${imageText1}"></textarea>
+</div>
+
+<div th:if="${text2}">
+    <h3>Extracted Text (File 2):</h3>
+    <textarea readonly th:text="${text2}"></textarea>
+</div>
+
+<div th:if="${diff}">
+    <h3>Comparison Result:</h3>
+    <textarea readonly th:text="${diff}"></textarea>
+</div>
+
+</body>
+</html>
