@@ -30,6 +30,8 @@ import org.springframework.web.multipart.MultipartFile;
 import javax.imageio.ImageIO;
 import java.awt.*;
 import java.awt.image.BufferedImage;
+import java.awt.image.ColorModel;
+import java.awt.image.WritableRaster;
 import java.io.*;
 import java.util.*;
 import java.util.List;
@@ -164,7 +166,7 @@ public class PdfTextService {
 
             // After OCR diffs, also run visual image diff (OpenCV)
             // (This will produce a highlighted diff PDF and return bytes if you choose to call that method)
-            byte[] highlightedPdf = comparePdfImagesWithOpenCV(pdf1, pdf2, 0.5);
+            byte[] highlightedPdf = comparePdfImagesWithOpenCV(pdf1, pdf2, 0.95);
 
             String downloadsPath = System.getProperty("user.home") + File.separator + "Downloads";
             File downloadsDir = new File(downloadsPath);
@@ -416,7 +418,16 @@ public class PdfTextService {
      * Compare two PDFs visually (graphs, charts, pictures) using OpenCV
      * and generate highlighted diff PDF + SSIM score + threshold check.
      */
-    public byte[] comparePdfImagesWithOpenCV(MultipartFile file1, MultipartFile file2, double threshold) throws Exception {
+    /**
+     * Compare two PDFs visually (graphs, charts, pictures) using region-wise SSIM
+     * and generate a highlighted diff PDF.
+     *
+     * @param file1 first PDF
+     * @param file2 second PDF
+     * @param ssimThreshold threshold below which regions are considered "different"
+     * @return PDF with highlighted differences
+     */
+    public byte[] comparePdfImagesWithOpenCV(MultipartFile file1, MultipartFile file2, double ssimThreshold) throws Exception {
         try (PDDocument doc1 = PDDocument.load(file1.getInputStream());
              PDDocument doc2 = PDDocument.load(file2.getInputStream())) {
 
@@ -436,51 +447,57 @@ public class PdfTextService {
 
                 if (img1 == null || img2 == null) continue;
 
+                // Resize to same size
+                if (img1.getWidth() != img2.getWidth() || img1.getHeight() != img2.getHeight()) {
+                    BufferedImage resized = new BufferedImage(img1.getWidth(), img1.getHeight(), img2.getType());
+                    Graphics2D g = resized.createGraphics();
+                    g.drawImage(img2, 0, 0, img1.getWidth(), img1.getHeight(), null);
+                    g.dispose();
+                    img2 = resized;
+                }
+
                 // Convert to OpenCV Mat
                 Mat mat1 = bufferedImageToMat(img1);
                 Mat mat2 = bufferedImageToMat(img2);
 
-                // Resize to same size
-                Imgproc.resize(mat2, mat2, mat1.size());
+                // Convert to grayscale
+                Mat gray1 = new Mat();
+                Mat gray2 = new Mat();
+                Imgproc.cvtColor(mat1, gray1, Imgproc.COLOR_BGR2GRAY);
+                Imgproc.cvtColor(mat2, gray2, Imgproc.COLOR_BGR2GRAY);
 
-                // --- Step 1: SSIM Score ---
-                double ssimScore = calculateSSIM(mat1, mat2);
-                boolean different = ssimScore < threshold;
+                // Sliding window region-wise SSIM
+                int windowSize = 50; // region size (adjust for sensitivity)
+                BufferedImage highlighted = deepCopy(img1);
+                Graphics2D g2 = highlighted.createGraphics();
+                g2.setColor(Color.RED);
+                g2.setStroke(new BasicStroke(3));
 
-                System.out.println("Page " + (i + 1) + " SSIM score: " + ssimScore +
-                        " | Different: " + different);
+                for (int y = 0; y < gray1.rows(); y += windowSize) {
+                    for (int x = 0; x < gray1.cols(); x += windowSize) {
+                        int w = Math.min(windowSize, gray1.cols() - x);
+                        int h = Math.min(windowSize, gray1.rows() - y);
 
-                // --- Step 2: Absolute diff for bounding box visualization ---
-                Mat diff = new Mat();
-                Core.absdiff(mat1, mat2, diff);
-                Imgproc.cvtColor(diff, diff, Imgproc.COLOR_BGR2GRAY);
-                Imgproc.threshold(diff, diff, 30, 255, Imgproc.THRESH_BINARY);
+                        Rect roi = new Rect(x, y, w, h);
+                        Mat sub1 = new Mat(gray1, roi);
+                        Mat sub2 = new Mat(gray2, roi);
 
-                // Find contours (difference regions)
-                List<MatOfPoint> contours = new ArrayList<>();
-                Imgproc.findContours(diff, contours, new Mat(), Imgproc.RETR_EXTERNAL, Imgproc.CHAIN_APPROX_SIMPLE);
+                        double score = calculateSSIM(sub1, sub2);
 
-                // Draw bounding boxes on first image if marked different
-                if (different) {
-                    for (MatOfPoint contour : contours) {
-                        Rect rect = Imgproc.boundingRect(contour);
-                        Imgproc.rectangle(mat1, rect, new Scalar(0, 0, 255), 3);
+                        if (score < ssimThreshold) {
+                            g2.drawRect(x, y, w, h);
+                        }
                     }
                 }
 
-                // Convert back to BufferedImage
-                BufferedImage highlighted = matToBufferedImage(mat1);
+                g2.dispose();
 
-                // Add to output PDF
+                // Add page result to PDF
                 ByteArrayOutputStream pageBaos = new ByteArrayOutputStream();
                 ImageIO.write(highlighted, "png", pageBaos);
                 Image itextImg = Image.getInstance(pageBaos.toByteArray());
                 itextImg.scaleToFit(500, 700);
-
                 outputDoc.add(new Paragraph("Page " + (i + 1) + " Graph/Image Comparison"));
-                outputDoc.add(new Paragraph("SSIM Score: " + String.format("%.4f", ssimScore) +
-                        " | Threshold: " + threshold +
-                        " | Different: " + (different ? "YES ❌" : "NO ✅")));
                 outputDoc.add(itextImg);
                 outputDoc.newPage();
             }
@@ -489,6 +506,35 @@ public class PdfTextService {
             return baos.toByteArray();
         }
     }
+
+    /**
+     * Calculate SSIM (Structural Similarity Index) between two grayscale regions.
+     */
+    private double calculateSSIM(Mat img1, Mat img2) {
+        Mat img1f = new Mat();
+        Mat img2f = new Mat();
+        img1.convertTo(img1f, CvType.CV_32F);
+        img2.convertTo(img2f, CvType.CV_32F);
+
+        // Compute absolute difference
+        Mat diff = new Mat();
+        Core.absdiff(img1f, img2f, diff);
+
+        // Compute mean difference
+        Scalar meanScalar = Core.mean(diff);
+        double meanDiff = meanScalar.val[0] / 255.0;
+
+        // Return "SSIM-like" similarity (1 = identical, 0 = completely different)
+        return 1.0 - meanDiff;
+    }
+
+    private BufferedImage deepCopy(BufferedImage bi) {
+        ColorModel cm = bi.getColorModel();
+        boolean isAlphaPremultiplied = cm.isAlphaPremultiplied();
+        WritableRaster raster = bi.copyData(null);
+        return new BufferedImage(cm, raster, isAlphaPremultiplied, null);
+    }
+
 
 
     // Utility: convert BufferedImage -> Mat using Imgcodecs.imdecode
@@ -522,129 +568,6 @@ public class PdfTextService {
             }
         }
         return m2;
-    }
-
-    /**
-     * Compute Structural Similarity Index (SSIM) between two images (grayscale).
-     * Returns value in [0,1] where 1.0 = identical, lower = more different.
-     */
-    private double calculateSSIM(Mat img1, Mat img2) {
-        // Convert to grayscale Mats
-        Mat gray1 = new Mat();
-        Mat gray2 = new Mat();
-        Imgproc.cvtColor(img1, gray1, Imgproc.COLOR_BGR2GRAY);
-        Imgproc.cvtColor(img2, gray2, Imgproc.COLOR_BGR2GRAY);
-
-        // Ensure same size
-        if (!gray1.size().equals(gray2.size())) {
-            Imgproc.resize(gray2, gray2, gray1.size());
-        }
-
-        // Convert to float32
-        Mat I1 = new Mat();
-        Mat I2 = new Mat();
-        gray1.convertTo(I1, CvType.CV_32F);
-        gray2.convertTo(I2, CvType.CV_32F);
-
-        // Gaussian blur (to obtain local means)
-        Mat mu1 = new Mat();
-        Mat mu2 = new Mat();
-        Size winSize = new Size(11, 11);
-        double sigma = 1.5;
-        Imgproc.GaussianBlur(I1, mu1, winSize, sigma);
-        Imgproc.GaussianBlur(I2, mu2, winSize, sigma);
-
-        // mu^2, mu1*mu2
-        Mat mu1_sq = new Mat();
-        Mat mu2_sq = new Mat();
-        Mat mu1_mu2 = new Mat();
-        Core.multiply(mu1, mu1, mu1_sq);
-        Core.multiply(mu2, mu2, mu2_sq);
-        Core.multiply(mu1, mu2, mu1_mu2);
-
-        // sigma^2, sigma12
-        Mat sigma1_sq = new Mat();
-        Mat sigma2_sq = new Mat();
-        Mat sigma12 = new Mat();
-
-        Mat temp1 = new Mat();
-        Mat temp2 = new Mat();
-
-        Imgproc.GaussianBlur(I1.mul(I1), temp1, winSize, sigma);
-        Core.subtract(temp1, mu1_sq, sigma1_sq);
-
-        Imgproc.GaussianBlur(I2.mul(I2), temp2, winSize, sigma);
-        Core.subtract(temp2, mu2_sq, sigma2_sq);
-
-        Imgproc.GaussianBlur(I1.mul(I2), temp1, winSize, sigma);
-        Core.subtract(temp1, mu1_mu2, sigma12);
-
-        // Constants for SSIM (stabilize the division)
-        // Common choice: (K1=0.01, K2=0.03) with L = 255 for 8-bit images
-        double C1 = Math.pow(0.01 * 255, 2); // ~6.5025
-        double C2 = Math.pow(0.03 * 255, 2); // ~58.5225
-
-        // numerator = (2*mu1_mu2 + C1) * (2*sigma12 + C2)
-        Mat t1 = new Mat();
-        Mat t2 = new Mat();
-        Mat numerator = new Mat();
-
-        Core.multiply(mu1_mu2, new Scalar(2.0), t1);
-        Core.add(t1, new Scalar(C1), t1);            // t1 = 2*mu1_mu2 + C1
-
-        Core.multiply(sigma12, new Scalar(2.0), t2);
-        Core.add(t2, new Scalar(C2), t2);            // t2 = 2*sigma12 + C2
-
-        Core.multiply(t1, t2, numerator);            // numerator = t1 * t2
-
-        // denominator = (mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2)
-        Mat denom1 = new Mat();
-        Mat denom2 = new Mat();
-        Mat denominator = new Mat();
-
-        Core.add(mu1_sq, mu2_sq, denom1);
-        Core.add(denom1, new Scalar(C1), denom1);
-
-        Core.add(sigma1_sq, sigma2_sq, denom2);
-        Core.add(denom2, new Scalar(C2), denom2);
-
-        Core.multiply(denom1, denom2, denominator);
-
-        // SSIM map = numerator / denominator
-        Mat ssim_map = new Mat();
-        Core.divide(numerator, denominator, ssim_map);
-
-        // mean SSIM over image
-        Scalar mssim = Core.mean(ssim_map);
-        double score = mssim.val[0];
-
-        // Release mats to avoid native memory leak
-        gray1.release();
-        gray2.release();
-        I1.release();
-        I2.release();
-        mu1.release();
-        mu2.release();
-        mu1_sq.release();
-        mu2_sq.release();
-        mu1_mu2.release();
-        sigma1_sq.release();
-        sigma2_sq.release();
-        sigma12.release();
-        temp1.release();
-        temp2.release();
-        t1.release();
-        t2.release();
-        numerator.release();
-        denom1.release();
-        denom2.release();
-        denominator.release();
-        ssim_map.release();
-
-        // Clamp to [0,1] just in case of numerical issues
-        if (Double.isNaN(score) || score < 0) score = 0.0;
-        if (score > 1.0) score = 1.0;
-        return score;
     }
 
 }
